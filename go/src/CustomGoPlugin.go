@@ -1,127 +1,246 @@
+/*
+Upstream (back-end) OAuth2 authentication plugin.
+
+Usage from an OAS API:
+1) Add the following parameters to Plugin Configuration/Config Data (example is for Salesforce)
+{
+  "BACKEND_ID": "SalesforceCRM",
+  "BACKEND_OAUTH_CLIENT_ID": "SFCRM_OAUTH_CLIENT_ID",
+  "BACKEND_OAUTH_CLIENT_SECRET": "SFCRM_OAUTH_CLIENT_SECRET",
+  "BACKEND_OAUTH_GRANT_TYPE": "SFCRM_OAUTH_GRANT_TYPE",
+  "BACKEND_OAUTH_PASSWORD": "SFCRM_OAUTH_PASSWORD",
+  "BACKEND_OAUTH_TOKEN_ENDPOINT": "SFCRM_OAUTH_TOKEN_ENDPOINT",
+  "BACKEND_OAUTH_USERNAME": "SFCRM_OAUTH_USERNAME"
+}
+2) Set Plugin Configuration/Plugin Driver to "Go Plugin"
+3) Add the following Post-plugin:
+ - Function Name = UpstreamOauthLogin
+ - Path = /opt/tyk-gateway/middleware/CustomGoPlugin.so
+4) Add the following Response-plugin:
+ - Function Name = CheckForExpiredAuth
+ - Path = /opt/tyk-gateway/middleware/CustomGoPlugin.so
+5) Make sure that the following Environment Variables are set for the Tyk Gateway (var names from step 1)
+ - SFCRM_OAUTH_GRANT_TYPE=password
+ - SFCRM_OAUTH_TOKEN_ENDPOINT=https://login.salesforce.com/services/oauth2/token
+ - SFCRM_OAUTH_USERNAME=****
+ - SFCRM_OAUTH_PASSWORD=****
+ - SFCRM_OAUTH_CLIENT_ID=****
+ - SFCRM_OAUTH_CLIENT_SECRET=****
+
+ You may have 0 or 1 OAuth2 back-end set up for an API
+ Each API may have its own back-end each of them would use a separate set of environment variables,
+*/
+
 package main
 
 import (
-	"io/ioutil"
+	"context"
+	"encoding/json"
+	"io"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
 
-	"github.com/TykTechnologies/opentelemetry/trace"
-	"github.com/TykTechnologies/tyk/apidef/oas"
+	"github.com/TykTechnologies/tyk/config"
 	"github.com/TykTechnologies/tyk/ctx"
-
 	"github.com/TykTechnologies/tyk/log"
-	"github.com/TykTechnologies/tyk/user"
+	"github.com/TykTechnologies/tyk/storage"
 )
 
 var logger = log.Get()
+var store storage.RedisCluster
 
-// AddFooBarHeader adds custom "Foo: Bar" header to the request
-func AddFooBarHeader(rw http.ResponseWriter, r *http.Request) {
-	// We create a new span using the context from the incoming request.
-	_, newSpan := trace.NewSpanFromContext(r.Context(), "", "GoPlugin_first-span")
+const BackendId = "BACKEND_ID"
+const BackendOauthGrantType = "BACKEND_OAUTH_GRANT_TYPE"
+const BackendOauthClientId = "BACKEND_OAUTH_CLIENT_ID"
+const BackendOauthClientSecret = "BACKEND_OAUTH_CLIENT_SECRET"
+const BackendOauthTokenEndpoint = "BACKEND_OAUTH_TOKEN_ENDPOINT"
+const BackendOauthUsername = "BACKEND_OAUTH_USERNAME"
+const BackendOauthPassword = "BACKEND_OAUTH_PASSWORD"
 
-	// Ensure that the span is properly ended when the function completes.
-	defer newSpan.End()
+const TokenCacheKeyHeader = "X-Odido-Backend-Id"
 
-	// Set a new name for the span.
-	newSpan.SetName("AddFooBarHeader Function")
+const RedisKeyPrefix = "odido.oauth.token."
 
-	// Set the status of the span.
-	newSpan.SetStatus(trace.SPAN_STATUS_OK, "")
+func getStore(appCtx context.Context) storage.RedisCluster {
 
-	r.Header.Add("X-SimpleHeader-Inject", "foo")
-}
+	// Get Tyk Config
+	conf := config.Global()
 
-// Custom Auth, applies a rate limit of
-// 2 per 10 given a token of "abc"
-func AuthCheck(rw http.ResponseWriter, r *http.Request) {
-	token := r.Header.Get("Authorization")
+	logger.Infof("Global config: %v+", conf)
 
-	_, newSpan := trace.NewSpanFromContext(r.Context(), "", "GoPlugin_custom-auth")
-	defer newSpan.End()
+	// Create Redis Controller
+	rc := storage.NewRedisController(appCtx)
+	logger.Debug("Created Redis Controller. Connected?", rc.Connected())
 
-	if token != "d3fd1a57-94ce-4a36-9dfe-679a8f493b49" && token != "3be61aa4-2490-4637-93b9-105001aa88a5" {
-		newSpan.SetAttributes(trace.NewAttribute("auth", "failed"))
-		newSpan.SetStatus(trace.SPAN_STATUS_ERROR, "")
-
-		rw.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	newSpan.SetAttributes(trace.NewAttribute("auth", "success"))
-	newSpan.SetStatus(trace.SPAN_STATUS_OK, "")
-
-	session := &user.SessionState{
-		Alias: token,
-		Rate:  2,
-		Per:   10,
-		MetaData: map[string]interface{}{
-			token: token,
-		},
-		KeyID: token,
-	}
-
-	ctx.SetSession(r, session, true)
-}
-
-// Injects meta data from a token where the metadata key is "foo"
-func InjectMetadata(rw http.ResponseWriter, r *http.Request) {
-	session := ctx.GetSession(r)
-	if session != nil {
-		// Access session fields such as MetaData
-		metaData := session.MetaData
-		foo, ok := metaData["foo"].(string) // Type assert foo to string
-		if !ok {
-			// Handle the case where foo is not a string or foo does not exist
-			logger.Error("Error: 'foo' is not a string or not found in metaData")
-			return // or continue, depending on your error handling strategy
+	store := storage.RedisCluster{KeyPrefix: "", HashKeys: conf.HashKeys, RedisController: rc}
+	go rc.ConnectToRedis(appCtx, nil, &conf)
+	for i := 0; i < 5; i++ { // max 5 attempts - should only take 2
+		if rc.Connected() {
+			logger.Debug("Redis Controller connected")
+			break
 		}
-		// Process metaData as needed
-		r.Header.Add("X-Metadata-Inject", foo)
+		logger.Debug("Redis Controller not connected, will retry")
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !rc.Connected() {
+		logger.Error("Could not connect to storage")
+	}
+
+	return store
+}
+
+func getEnvVar(name interface{}) string {
+	value := os.Getenv(name.(string))
+	if value == "" {
+		logger.Errorf("Environment variable is not set: %v", name)
+	}
+	return value
+}
+
+func login(pluginConfig map[string]interface{}) (string, string, int64) {
+
+	clientId := getEnvVar(pluginConfig[BackendOauthClientId].(string))
+	clientSecret := getEnvVar(pluginConfig[BackendOauthClientSecret].(string))
+	username := getEnvVar(pluginConfig[BackendOauthUsername].(string))
+	password := getEnvVar(pluginConfig[BackendOauthPassword].(string))
+	tokenEndpoint := getEnvVar(pluginConfig[BackendOauthTokenEndpoint].(string))
+	grantType := getEnvVar(pluginConfig[BackendOauthGrantType].(string))
+
+	if clientId != "" && clientSecret != "" && username != "" && password != "" && tokenEndpoint != "" {
+		loginBody := url.Values{}
+		loginBody.Set("grant_type", grantType)
+		loginBody.Add("client_id", clientId)
+		loginBody.Add("client_secret", clientSecret)
+		if grantType == "password" {
+			loginBody.Add("format", "json")
+			loginBody.Add("username", username)
+			loginBody.Add("password", password)
+		}
+
+		logger.Debugf("sending login request to %s: %v", tokenEndpoint, loginBody)
+
+		loginResponse, err := http.PostForm(tokenEndpoint, loginBody)
+
+		if err != nil {
+			logger.Errorf("error logging in to %s : %v", tokenEndpoint, err)
+			return "", "", 0
+		}
+
+		if loginResponse.StatusCode >= 400 {
+			logger.Errorf("error logging in to %s : %+v", tokenEndpoint, loginResponse)
+			body, _ := io.ReadAll(loginResponse.Body)
+			logger.Errorf("%+v", string(body))
+			return "", "", 0
+		}
+
+		defer loginResponse.Body.Close()
+		loginResponseBody, err2 := io.ReadAll(loginResponse.Body)
+		if err2 != nil {
+			logger.Infof("error reading response from %s : %v", tokenEndpoint, err2)
+			return "", "", 0
+		}
+		var responseMap map[string]interface{}
+		err3 := json.Unmarshal(loginResponseBody, &responseMap)
+
+		if err3 != nil {
+			logger.Infof("error decoding response %v: %v", string(loginResponseBody[:]), err3)
+			return "", "", 0
+		}
+
+		logger.Infof("logged in to %s : %v", tokenEndpoint, responseMap)
+		accessToken := responseMap["access_token"].(string)
+		instanceUrl := ""
+		if responseMap["instance_url"] != nil {
+			instanceUrl = responseMap["instance_url"].(string)
+		}
+		expiresIn := int64(3600)
+		if responseMap["expires_in"] != nil {
+			expiresIn = responseMap["expires_in"].(int64)
+		}
+		return accessToken, instanceUrl, expiresIn
+
+	}
+	return "", "", 0
+}
+
+func UpstreamOauthLogin(rw http.ResponseWriter, r *http.Request) {
+
+	apiDef := ctx.GetOASDefinition(r)
+	apiExtensions := apiDef.GetTykExtension()
+
+	logger.Infof("API Extensions: %+v", apiExtensions)
+	pluginConfig := apiExtensions.Middleware.Global.PluginConfig.Data.Value
+	backendId := pluginConfig[BackendId].(string)
+	cacheKey := RedisKeyPrefix + backendId
+	accessToken := ""
+	instanceUrl := ""
+
+	ttlSeconds, err := store.GetKeyTTL(cacheKey)
+	if err == nil {
+		if ttlSeconds > 1 {
+			accessTokenAndUrl, err2 := store.GetKey(cacheKey)
+			if err2 == nil && strings.Contains(accessTokenAndUrl, "|") {
+				parts := strings.Split(accessTokenAndUrl, "|")
+				accessToken = parts[0]
+				instanceUrl = parts[1]
+			} else {
+				logger.Warnf("Error retrieving access token value from cache: %v", err2)
+			}
+		} else {
+			logger.Info("Access token expired, acquiring a new one")
+		}
+	} else {
+		logger.Warnf("Error retrieving access token TTL from cache: %v", err)
+	}
+
+	if accessToken == "" {
+		accessToken2, instanceUrl2, ttlSeconds2 := login(pluginConfig)
+		if accessToken2 != "" && ttlSeconds2 > 0 {
+			store.SetKey(cacheKey, accessToken2+"|"+instanceUrl2, ttlSeconds2)
+			accessToken = accessToken2
+			instanceUrl = instanceUrl2
+			logger.Info("Acquired access token for " + backendId)
+		} else {
+			logger.Error("Cannot acquire access token for " + backendId)
+			accessToken = ""
+		}
+	}
+
+	if instanceUrl != "" {
+		logger.Debugf("instance URL: %s", instanceUrl)
+		apiExtensions.Upstream.URL = instanceUrl
+		apiDef.SetTykExtension(apiExtensions)
+	}
+
+	if accessToken != "" {
+		r.Header.Add(TokenCacheKeyHeader, backendId)
+		r.Header.Add("Authorization", "Bearer "+accessToken)
 	}
 }
 
-// Injects config data, both from an env variable and hard-coded
-func InjectConfigData(rw http.ResponseWriter, r *http.Request) {
-	oasDef := ctx.GetOASDefinition(r)
+func CheckForExpiredAuth(rw http.ResponseWriter, res *http.Response, req *http.Request) {
 
-	 // Extract the middleware section safely
-	 xTyk, ok := oasDef.Extensions["x-tyk-api-gateway"].(*oas.XTykAPIGateway)
-	 if !ok {
-		 logger.Println("Middleware extension is missing or invalid.")
-		 return
-	 }
-
-	 configKey := xTyk.Middleware.Global.PluginConfig.Data.Value["env-config-example"].(string)
-	 r.Header.Add("X-ConfigData-Config", configKey)
-}
-
-// Injects config data, both from an env variable and hard-coded
-func MakeOutboundCall(rw http.ResponseWriter, r *http.Request) {
-	// Define the URL
-	url := "https://httpbin.org/get"
-
-	// Create a GET request
-	response, err := http.Get(url)
-	if err != nil {
-		logger.Info("Error making GET request: %s\n", err)
-		return
+	if res.StatusCode == 401 {
+		backendId := req.Header.Get(TokenCacheKeyHeader)
+		if backendId != "" {
+			cacheKey := RedisKeyPrefix + backendId
+			logger.Infof("Service returned 401 response, deleting key from token cache: %s", cacheKey)
+			store.DeleteKey(cacheKey)
+		}
 	}
-	defer response.Body.Close()
-
-	// Read the response body
-	responseData, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		logger.Info("Error reading response: %s\n", err)
-		return
-	}
-
-	// Print the response body
-	logger.Info(string(responseData))
 }
 
 func main() {}
 
 // This will be run during Gateway startup
 func init() {
+
+	store = getStore(context.Background())
+
 	logger.Info("--- Go custom plugin init success! ---- ")
 }

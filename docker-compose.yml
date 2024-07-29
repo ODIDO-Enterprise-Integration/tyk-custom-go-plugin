@@ -18,12 +18,17 @@ services:
     env_file:
       - ./tyk/confs/tyk.env
     environment:
-      - SOME_CONFIG_DATA=some-config-data-from-env
+      - SFCRM_OAUTH_GRANT_TYPE=password
+      - SFCRM_OAUTH_TOKEN_ENDPOINT=https://login.salesforce.com/services/oauth2/token
+      - SFCRM_OAUTH_USERNAME=TBD
+      - SFCRM_OAUTH_PASSWORD=TBD
+      - SFCRM_OAUTH_CLIENT_ID=TBD
+      - SFCRM_OAUTH_CLIENT_SECRET=TBD
     networks:
       - tyk
 
   tyk-pump:
-    image: tykio/tyk-pump-docker-pub:v1.8.3
+    image: tykio/tyk-pump-docker-pub:v1.10.0
     depends_on:
       - tyk-gateway
       - tyk-mongo
