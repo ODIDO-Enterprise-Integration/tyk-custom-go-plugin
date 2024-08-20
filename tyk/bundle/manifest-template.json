@@ -3,9 +3,17 @@
     "CustomGoPlugin_replace_version_linux_replace_platform.so"
   ],
   "custom_middleware": {
-    "pre": [
+    "post": [
       {
-        "name": "AddFooBarHeader",
+        "name": "UpstreamOauthLogin",
+        "path": "CustomGoPlugin.so",
+        "require_session": false,
+        "raw_body_only": false
+      }
+    ],
+    "response": [
+      {
+        "name": "CheckForExpiredAuth",
         "path": "CustomGoPlugin.so",
         "require_session": false,
         "raw_body_only": false

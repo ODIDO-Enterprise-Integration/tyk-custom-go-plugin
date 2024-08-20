@@ -214,7 +214,26 @@ func UpstreamOauthLogin(rw http.ResponseWriter, r *http.Request) {
 	if instanceUrl != "" {
 		logger.Debugf("instance URL: %s", instanceUrl)
 		apiExtensions.Upstream.URL = instanceUrl
+		logger.Infof("NEW API Extensions: %+v", apiExtensions)
 		apiDef.SetTykExtension(apiExtensions)
+
+		// *** Try setting the OAS, instead of the deep copy of the OAS
+		// v := r.Context().Value(ctx.OASDefinition)
+		// myOas, ok := v.(*oas.OAS)
+
+		// if ok {
+		// 	myOas.SetTykExtension(apiExtensions)
+		// 	logger.Infof("NEW API Extensions were set: %+v", ctx.GetOASDefinition(r).GetTykExtension())
+		// } else {
+		// 	logger.Warn("NEW API Extensions were not set!")
+		// }
+
+		newUrl := instanceUrl + r.URL.Path + "?" + r.URL.RawQuery
+		r.Header.Add("X-Odido-Request-URL", newUrl)
+		// *** Try updating the pointer to the request - I don't know Go, but this would not make sense in C, I try it anyway
+		// ctx2 := context.WithValue(r.Context(), ctx.UrlRewriteTarget, newUrl)
+		// r2 := r.WithContext(ctx2)
+		// *r = *r2
 	}
 
 	if accessToken != "" {
@@ -224,6 +243,24 @@ func UpstreamOauthLogin(rw http.ResponseWriter, r *http.Request) {
 }
 
 func CheckForExpiredAuth(rw http.ResponseWriter, res *http.Response, req *http.Request) {
+
+	serverName := res.TLS.ServerName
+	certs := res.TLS.PeerCertificates
+	certSubject := "unknown"
+	if len(certs) > 0 {
+		certSubject = certs[0].Subject.CommonName
+	}
+	requestHostHeader := res.Request.Host
+	requestUrl := req.Header.Get("X-Odido-Request-URL")
+
+	logger.Info("####### X-TLS-SNI " + serverName)
+	logger.Info("####### X-TLS-Cert-Subject " + certSubject)
+	logger.Info("####### X-Request-Host-Header " + requestHostHeader)
+
+	res.Header.Add("X-Odido-TLS-SNI", serverName)
+	res.Header.Add("X-Odido-TLS-Cert-Subject", certSubject)
+	res.Header.Add("X-Odido-Request-Host-Header", requestHostHeader)
+	res.Header.Add("X-Odido-Request-URL", requestUrl)
 
 	if res.StatusCode == 401 {
 		backendId := req.Header.Get(TokenCacheKeyHeader)
